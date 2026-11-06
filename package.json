@@ -1,0 +1,25 @@
+{
+  "name": "kiroween-bleeding-canvas",
+  "version": "1.0.0",
+  "description": "Interactive Visceral Desktop Overlay for Kiroween 2026 (Costume Contest)",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron main.js",
+    "demo": "electron main.js --demo",
+    "debug": "electron main.js --debug"
+  },
+  "keywords": [
+    "kiro",
+    "kiroween",
+    "spec-driven",
+    "halloween",
+    "canvas2d",
+    "desktop-overlay",
+    "electron"
+  ],
+  "author": "Lainholic",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^45.2.3"
+  }
+}

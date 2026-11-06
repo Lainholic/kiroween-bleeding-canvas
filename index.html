@@ -1,0 +1,1186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' file: data: blob:; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'">
+  <title>Bleeding Canvas Overlay</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; user-select: none; }
+    html, body {
+      width: 100vw; height: 100vh;
+      overflow: hidden;
+      background: transparent;
+      pointer-events: none;
+    }
+    canvas {
+      position: absolute; top: 0; left: 0;
+      width: 100vw; height: 100vh;
+      background: transparent;
+      pointer-events: none;
+    }
+    /* Blood layer 1: coagulated rim + physical-thickness drop shadow */
+    #rim-canvas  { filter: url(#visceral-goo) drop-shadow(0 3px 3px rgba(15, 0, 0, 0.75)); }
+    /* Blood layer 2: translucent arterial volume */
+    #body-canvas { filter: url(#visceral-goo); }
+    /* Ghost ectoplasm (glowing). Hidden while empty so the filter costs nothing. */
+    #ecto-canvas { filter: url(#visceral-goo) drop-shadow(0 0 5px rgba(155, 48, 255, 0.85)); visibility: hidden; }
+  </style>
+</head>
+<body>
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+    <filter id="visceral-goo" color-interpolation-filters="sRGB" x="-10%" y="-10%" width="120%" height="120%">
+      <feGaussianBlur in="SourceGraphic" stdDeviation="4" result="blur"/>
+      <!-- Alpha row loosened from 22 -9 to 16 -4 so thin trails are not cut off -->
+      <feColorMatrix in="blur" mode="matrix"
+        values="1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 16 -4"/>
+    </filter>
+  </svg>
+
+  <!-- Bottom to top: glass cracks, blood rim, blood body, ecto, gloss, weapons, flying fx -->
+  <canvas id="crack-canvas"></canvas>
+  <canvas id="rim-canvas"></canvas>
+  <canvas id="body-canvas"></canvas>
+  <canvas id="ecto-canvas"></canvas>
+  <canvas id="gloss-canvas"></canvas>
+  <canvas id="weapon-canvas"></canvas>
+  <canvas id="fx-canvas"></canvas>
+
+  <script>
+  (() => {
+    'use strict';
+
+    // ---------------------------------------------------------------
+    // Tunables
+    // ---------------------------------------------------------------
+    const IDLE_SPEED = 1.5;        // px per poll tick
+    const IDLE_MS = 180;           // dwell before pooling starts
+    const TENSION_MASS = 12;       // pool mass at which a drop detaches
+    const MAX_NODES = 9000;
+    const MAX_WEAPONS = 12;
+    const MAX_FX = 400;
+    const FRESH_END = 4, COAG_END = 10; // seconds
+    const RIM_GROW = 1.8;
+    const TAIL_STEP = 3;           // px between drip tail nodes
+    const ASSET = 500;             // weapon art is authored in a 500x500 frame
+    const DEG = Math.PI / 180;
+
+    const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+    const rand = (a, b) => a + Math.random() * (b - a);
+    const lerp = (a, b, t) => a + (b - a) * t;
+    const smooth = (t) => t * t * (3 - 2 * t);
+    const easeOut = (t) => 1 - Math.pow(1 - t, 3);
+    const now = () => performance.now();
+
+    // ---------------------------------------------------------------
+    // Canvases
+    // ---------------------------------------------------------------
+    const LAYERS = ['crack', 'rim', 'body', 'ecto', 'gloss', 'weapon', 'fx'];
+    const cv = {}, cx = {};
+    for (const id of LAYERS) {
+      cv[id] = document.getElementById(id + '-canvas');
+      cx[id] = cv[id].getContext('2d');
+    }
+    let W = 0, H = 0;
+    function resize() {
+      W = window.innerWidth || screen.width || 1920;
+      H = window.innerHeight || screen.height || 1080;
+      for (const id of LAYERS) { cv[id].width = W; cv[id].height = H; }
+      cx.weapon.imageSmoothingQuality = 'high';
+    }
+    window.addEventListener('resize', resize);
+    resize();
+
+    // ---------------------------------------------------------------
+    // Procedural Web Audio engine (no audio files)
+    // ---------------------------------------------------------------
+    let ac = null, master = null, noiseBuf = null;
+    function audio() {
+      if (!ac) {
+        try {
+          ac = new AudioContext();
+          master = ac.createGain();
+          master.gain.value = 0.55;
+          master.connect(ac.destination);
+          noiseBuf = ac.createBuffer(1, ac.sampleRate, ac.sampleRate);
+          const d = noiseBuf.getChannelData(0);
+          for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+        } catch (e) { ac = null; return null; }
+      }
+      if (ac.state === 'suspended') ac.resume().catch(() => {});
+      return ac;
+    }
+    function env(g, t, peak, attack, decay) {
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(peak, t + attack);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + attack + decay);
+    }
+    function noise(t, dur) {
+      const s = ac.createBufferSource();
+      s.buffer = noiseBuf;
+      s.start(t, Math.random() * 0.5, dur + 0.05);
+      return s;
+    }
+    // Knife / axe: glass shatter + blade embed
+    function glassSound(vol) {
+      if (!audio()) return;
+      const t = ac.currentTime + 0.005;
+      const hp = ac.createBiquadFilter();
+      hp.type = 'highpass'; hp.frequency.value = rand(2500, 6000);
+      const ng = ac.createGain(); env(ng, t, 0.5 * vol, 0.002, 0.06);
+      noise(t, 0.08).connect(hp).connect(ng).connect(master);
+      const pings = 4 + Math.floor(Math.random() * 3);
+      for (let i = 0; i < pings; i++) {
+        const o = ac.createOscillator(), g = ac.createGain();
+        const st = t + rand(0, 0.04);
+        o.type = 'sine'; o.frequency.value = rand(1800, 4200);
+        env(g, st, rand(0.05, 0.12) * vol, 0.001, rand(0.08, 0.22));
+        o.connect(g).connect(master); o.start(st); o.stop(st + 0.3);
+      }
+      const th = ac.createOscillator(), tg = ac.createGain();
+      th.type = 'sine';
+      th.frequency.setValueAtTime(90, t);
+      th.frequency.exponentialRampToValueAtTime(30, t + 0.12);
+      env(tg, t, 0.6 * vol, 0.003, 0.12);
+      th.connect(tg).connect(master); th.start(t); th.stop(t + 0.16);
+    }
+    // Pumpkin / blood burst: LFO-modulated band-pass squish
+    function wetSplat(vol) {
+      if (!audio()) return;
+      const t = ac.currentTime + 0.005;
+      const bp = ac.createBiquadFilter();
+      bp.type = 'bandpass'; bp.Q.value = 1.6;
+      const f = rand(400, 1200); bp.frequency.value = f;
+      const lfo = ac.createOscillator(), lg = ac.createGain();
+      lfo.frequency.value = rand(18, 35); lg.gain.value = f * 0.45;
+      lfo.connect(lg).connect(bp.frequency); lfo.start(t); lfo.stop(t + 0.26);
+      const g = ac.createGain(); env(g, t, vol, 0.004, 0.18);
+      noise(t, 0.22).connect(bp).connect(g).connect(master);
+    }
+    // Kiro ghost: gliding triangle shimmer with vibrato + slime squish
+    function ghostSound() {
+      if (!audio()) return;
+      const t = ac.currentTime + 0.005;
+      const o = ac.createOscillator(), g = ac.createGain();
+      o.type = 'triangle';
+      o.frequency.setValueAtTime(600, t);
+      o.frequency.exponentialRampToValueAtTime(220, t + 0.8);
+      const vib = ac.createOscillator(), vg = ac.createGain();
+      vib.frequency.value = 6.5; vg.gain.value = 14;
+      vib.connect(vg).connect(o.frequency);
+      env(g, t, 0.18, 0.03, 0.8);
+      o.connect(g).connect(master);
+      o.start(t); o.stop(t + 0.9); vib.start(t); vib.stop(t + 0.9);
+      wetSplat(0.3);
+    }
+    function dripSound() {
+      if (!audio()) return;
+      const t = ac.currentTime + 0.005;
+      const o = ac.createOscillator(), g = ac.createGain();
+      o.type = 'sine';
+      o.frequency.setValueAtTime(560 + Math.random() * 200, t);
+      o.frequency.exponentialRampToValueAtTime(140, t + 0.09);
+      env(g, t, 0.06, 0.002, 0.09);
+      o.connect(g).connect(master); o.start(t); o.stop(t + 0.12);
+    }
+
+    // ---------------------------------------------------------------
+    // Fluid palette (blood, pumpkin juice, ghost ectoplasm)
+    // ---------------------------------------------------------------
+    const KINDS = {
+      blood:   { lo: [143, 3, 3],    hi: [184, 4, 4],    dry: [59, 3, 3],    rim: '#2a0000', ecto: false },
+      pumpkin: { lo: [196, 82, 6],   hi: [255, 140, 26], dry: [104, 40, 4],  rim: '#3a1300', ecto: false },
+      purple:  { lo: [122, 34, 214], hi: [155, 48, 255], dry: [62, 18, 104], rim: '#1c0433', ecto: true },
+      green:   { lo: [40, 214, 16],  hi: [57, 255, 20],  dry: [28, 100, 16], rim: '#082604', ecto: true },
+    };
+
+    // ---------------------------------------------------------------
+    // World state
+    // ---------------------------------------------------------------
+    const nodes = [];      // static aged fluid nodes
+    const drips = [];      // gravity drip heads
+    const particles = [];  // airborne blood droplets
+    const weapons = [];    // thrown items
+    const cracks = [];     // pre-rendered glass fractures
+    const emitters = [];   // continuous drip sources (crack centers, blade edges)
+    const fx = [];         // pumpkin pulp and seeds
+    let poolNode = null;
+    let poolMass = 0;
+
+    // When the cap is hit, recycle an existing slot instead of dropping new blood,
+    // so fresh splatters always appear and memory stays bounded.
+    let recycle = 0;
+    function addNode(x, y, r, hl, tone, kind) {
+      const n = { x, y, r, born: now(), life: rand(10.5, 15), tone: tone ?? Math.random(), hl: !!hl, kind: kind || 'blood' };
+      if (nodes.length < MAX_NODES) nodes.push(n);
+      else {
+        recycle = (recycle + 1) % nodes.length;
+        if (nodes[recycle] === poolNode) recycle = (recycle + 1) % nodes.length;
+        nodes[recycle] = n;
+      }
+      return n;
+    }
+    // ---------------------------------------------------------------
+    // Input: OS-level stream (primary) + DOM fallback (browser/dev)
+    // ---------------------------------------------------------------
+    const DEMO = new URLSearchParams(location.search).has('demo');
+    let demoUntil = 0;
+    let lastGlobal = 0;
+    let prev = null;
+    let speed = 0;
+    let idleMs = 0;
+    let lastClickAt = 0;
+    const cursor = { x: -1000, y: -1000 };
+
+    // Weapon throws are rare: 5% of clicks, or a rapid click combo.
+    const THROW_CHANCE = 0.05;
+    const COMBO_GAP_MS = 320;       // max gap between clicks to keep a combo going
+    const COMBO_THROW = 5;          // rapid clicks in a row that trigger a throw
+    const THROW_COOLDOWN_MS = 1500; // no back-to-back throws
+    let combo = 0;
+    let lastThrowAt = -1e9;
+
+    function click(x, y) {
+      const t = now();
+      if (t - lastClickAt < 60) return;           // ignore double-reported edges
+      combo = t - lastClickAt <= COMBO_GAP_MS ? combo + 1 : 1;
+      lastClickAt = t;
+      const ready = t - lastThrowAt > THROW_COOLDOWN_MS;
+      if (ready && (combo >= COMBO_THROW || Math.random() < THROW_CHANCE)) {
+        lastThrowAt = t;
+        combo = 0;                                // a new combo is needed for the next throw
+        throwAt(x, y);
+      } else {
+        splatter(x, y);                           // plain blood burst
+        wetSplat(0.45);
+      }
+    }
+
+    function handleMouse(m) {
+      cursor.x = m.x; cursor.y = m.y;
+      speed = Math.hypot(m.vx, m.vy);
+      if (speed >= IDLE_SPEED && prev) {
+        emitTrail(prev.x, prev.y, m.x, m.y, speed);
+        poolNode = null; poolMass = 0;   // leave the pool behind, it ages on its own
+      }
+      prev = { x: m.x, y: m.y };
+      if (m.isClicked) click(m.x, m.y);
+    }
+
+    if (window.overlay) {
+      window.overlay.onGlobalMouse((m) => {
+        lastGlobal = now();
+        if (now() < demoUntil) {          // scripted demo owns the cursor
+          if (m.isClicked) click(m.x, m.y);
+          return;
+        }
+        handleMouse(m);
+      });
+      window.overlay.onClear(clearAll);
+    }
+    let domPrev = null;
+    window.addEventListener('mousemove', (e) => {
+      if (now() - lastGlobal < 300) return;
+      const vx = domPrev ? e.clientX - domPrev.x : 0, vy = domPrev ? e.clientY - domPrev.y : 0;
+      domPrev = { x: e.clientX, y: e.clientY };
+      handleMouse({ x: e.clientX, y: e.clientY, vx, vy, isClicked: false });
+    });
+    window.addEventListener('mousedown', (e) => {
+      if (now() - lastGlobal < 300) return;
+      handleMouse({ x: e.clientX, y: e.clientY, vx: 0, vy: 0, isClicked: true });
+    });
+
+    function clearAll() {
+      nodes.length = 0; drips.length = 0; particles.length = 0;
+      weapons.length = 0; cracks.length = 0; emitters.length = 0; fx.length = 0;
+      poolNode = null; poolMass = 0;
+    }
+
+    // ---------------------------------------------------------------
+    // State A: smear & trail (fast = thin streak, slow = thick ridge)
+    // ---------------------------------------------------------------
+    let trailCounter = 0;
+    function emitTrail(x0, y0, x1, y1, spd) {
+      const r = clamp(18 / (1 + spd * 0.05), 4.5, 16);
+      const dist = Math.hypot(x1 - x0, y1 - y0);
+      const spacing = Math.max(3, r * 0.45);
+      const steps = Math.min(120, Math.max(1, Math.ceil(dist / spacing)));
+      for (let i = 1; i <= steps; i++) {
+        const t = i / steps;
+        const jitter = r * 0.15;
+        const wet = spd < 10 && r >= 6 && (++trailCounter % 2 === 0);
+        addNode(
+          x0 + (x1 - x0) * t + rand(-jitter, jitter),
+          y0 + (y1 - y0) * t + rand(-jitter, jitter),
+          r * rand(0.9, 1.15), wet);
+      }
+    }
+
+    // ---------------------------------------------------------------
+    // State B: pooling and heavy drip
+    // ---------------------------------------------------------------
+    function updatePool(dt) {
+      if (cursor.x < 0) return;
+      if (speed < IDLE_SPEED) idleMs += dt; else idleMs = 0;
+      if (idleMs <= IDLE_MS) return;
+      if (!poolNode) {
+        poolNode = addNode(cursor.x, cursor.y + 1, 3, true, 0.6);
+        poolMass = 0;
+      }
+      if (!poolNode) return;
+      poolMass += dt * 0.014;
+      poolNode.r = 3 + Math.sqrt(poolMass) * 1.7;
+      poolNode.born = now();            // actively fed, stays fresh
+      poolNode.x = cursor.x; poolNode.y = cursor.y + 1;
+      if (poolMass > TENSION_MASS) {
+        spawnDrip(cursor.x, cursor.y + poolNode.r * 0.6, 12);
+        poolMass -= 8;
+        dripSound();
+      }
+    }
+
+    // ---------------------------------------------------------------
+    // Drips: stop-and-go surface tension, tapered tails, meandering
+    // ---------------------------------------------------------------
+    function spawnDrip(x, y, mass, kind) {
+      if (drips.length > 200) return;
+      drips.push({
+        x, y, vx: 0, vy: 0.1, mass, seed: Math.random() * 100, kind: kind || 'blood',
+        friction: rand(2.2, 5.7), load: 0, slipping: false, lastTailY: y, born: now(),
+      });
+    }
+    const headRadius = (d) => 2.2 + Math.sqrt(d.mass) * 1.35;
+
+    function updateDrips(k) {
+      const t = now();
+      for (let i = drips.length - 1; i >= 0; i--) {
+        const d = drips[i];
+        const r = headRadius(d);
+        if (!d.slipping) {
+          d.vy = 0.12;                                   // crawl while stuck
+          d.load += 0.045 * k * Math.sqrt(d.mass);        // weight builds against friction
+          if (d.load >= d.friction) {                     // surface tension breaks
+            d.slipping = true;
+            d.vy = 3.2 + d.mass * 0.35;                   // rapid slip
+          }
+        } else {
+          d.vy *= Math.pow(0.968, k);                     // decelerates as it drains
+          if (d.vy < 0.45) {
+            d.slipping = false; d.load = 0; d.friction = rand(2.2, 5.7);
+          }
+        }
+        // Organic micro-meandering (damped while stuck)
+        d.vx = Math.sin(d.y * 0.07 + d.seed) * 0.25 * Math.min(1, d.vy / 1.5);
+        d.x += d.vx * k;
+        d.y += d.vy * k;
+        // Tapered tail nodes, head loses mass
+        const tailR = r * clamp(1 / (1 + d.vy * 0.18), 0.2, 0.85);
+        // Mass drains per pixel travelled (dm/dy = -(0.01 + 0.012 m)),
+        // so a drop runs roughly 90 px (mass 4) to 200 px (mass 19) before it stops.
+        while (d.y - d.lastTailY >= TAIL_STEP) {
+          d.lastTailY += TAIL_STEP;
+          const tx = d.x - d.vx * 2;
+          // Tail = capsules; a new one every 12 px, otherwise stretch the last
+          if (!d.tail || d.lastTailY - d.tail.y2 > 12) {
+            d.tail = addNode(tx, d.lastTailY, tailR, false, 0.5, d.kind);
+            d.tail.x2 = tx; d.tail.y2 = d.lastTailY;
+          } else {
+            d.tail.x = tx; d.tail.y = d.lastTailY; d.tail.r = tailR;
+          }
+          d.mass -= TAIL_STEP * (0.01 + 0.012 * d.mass);
+        }
+        const age = (t - d.born) / 1000;
+        if (d.mass < 0.8 || d.y > H - 4 || age > 15) {
+          addNode(d.x, Math.min(d.y, H - 3), Math.max(r * 0.8, 2.5), true, 0.4, d.kind); // coagulates
+          drips.splice(i, 1);
+        }
+      }
+    }
+
+    // ---------------------------------------------------------------
+    // Radial blood burst (15-25 droplets + micro-spatter rays + stain)
+    // ---------------------------------------------------------------
+    function splatter(x, y) {
+      addNode(x, y, rand(16, 24), true, 0.3);
+      const lobes = 6 + Math.floor(Math.random() * 4);
+      for (let i = 0; i < lobes; i++) {
+        const a = Math.random() * Math.PI * 2, d = rand(10, 24);
+        addNode(x + Math.cos(a) * d, y + Math.sin(a) * d, rand(5, 10), Math.random() < 0.6);
+      }
+      const count = 15 + Math.floor(Math.random() * 11);
+      for (let i = 0; i < count; i++) {
+        const a = Math.random() * Math.PI * 2, s = rand(2, 13);
+        particles.push({
+          x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s,
+          radius: rand(2.5, 8), frames: 0, maxFrames: 14 + Math.floor(Math.random() * 26), micro: false,
+        });
+      }
+      const micro = 28 + Math.floor(Math.random() * 14);
+      for (let i = 0; i < micro; i++) {
+        const a = Math.random() * Math.PI * 2, s = rand(9, 18);
+        particles.push({
+          x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s,
+          radius: rand(2.2, 3.4), frames: 0, maxFrames: 4 + Math.floor(Math.random() * 6), micro: true,
+        });
+      }
+    }
+
+    function updateParticles(k) {
+      for (let i = particles.length - 1; i >= 0; i--) {
+        const p = particles[i];
+        const x0 = p.x, y0 = p.y;
+        p.x += p.vx * k; p.y += p.vy * k;
+        p.vy += 0.12 * k;
+        p.vx *= Math.pow(p.micro ? 0.99 : 0.965, k);
+        p.frames += k;
+        if (p.micro) p.radius *= Math.pow(0.9, k);          // rays taper to a point
+        const tr = p.radius * (p.micro ? 0.8 : 0.55);
+        // Streak = capsules; stretch the current one until it is 14 px long
+        if (!p.seg || Math.hypot(p.x - p.seg.x2, p.y - p.seg.y2) > 14) {
+          p.seg = addNode(p.x, p.y, tr, false);
+          p.seg.x2 = x0; p.seg.y2 = y0;
+        } else {
+          p.seg.x = p.x; p.seg.y = p.y; p.seg.r = Math.min(p.seg.r, tr);
+        }
+        const offscreen = p.x < -30 || p.x > W + 30 || p.y > H + 30 || p.y < -30;
+        if (p.frames >= p.maxFrames || offscreen) {
+          particles.splice(i, 1);
+          if (offscreen) continue;
+          addNode(p.x, p.y, p.radius, !p.micro);
+          const mass = p.radius * p.radius * 0.3;
+          if (!p.micro && mass >= 6) spawnDrip(p.x, p.y + p.radius * 0.5, mass); // into gravity system
+        }
+      }
+    }
+    // ---------------------------------------------------------------
+    // Procedural weapon art (fallback when a PNG is missing).
+    // Drawn in the same 500x500 layout as the PNGs so anchors match.
+    // ---------------------------------------------------------------
+    function bloodSmear(g, spots) {
+      for (const [x, y, s] of spots) {
+        const sz = s || 1;
+        g.fillStyle = 'rgba(70, 0, 0, 0.92)';
+        g.beginPath(); g.ellipse(x, y, 20 * sz, 12 * sz, 0.3, 0, 7); g.fill();
+        g.fillStyle = 'rgba(150, 6, 6, 0.9)';
+        for (let i = 0; i < 5; i++) {
+          g.beginPath(); g.arc(x + rand(-18, 18) * sz, y + rand(-8, 8) * sz, rand(4, 9) * sz, 0, 7); g.fill();
+        }
+        g.strokeStyle = 'rgba(110, 0, 0, 0.95)'; g.lineCap = 'round'; g.lineWidth = 6 * sz;
+        g.beginPath(); g.moveTo(x, y); g.lineTo(x + rand(-3, 3), y + rand(20, 45) * sz); g.stroke();
+        g.fillStyle = 'rgba(255, 215, 215, 0.7)';
+        g.beginPath(); g.ellipse(x - 6 * sz, y - 4 * sz, 4 * sz, 2.5 * sz, -0.6, 0, 7); g.fill();
+      }
+    }
+
+    function steel(g, x0, y0, x1, y1) {
+      const s = g.createLinearGradient(x0, y0, x1, y1);
+      s.addColorStop(0, '#50565c'); s.addColorStop(0.5, '#8e959b');
+      s.addColorStop(0.85, '#bfc6cc'); s.addColorStop(1, '#e8eef2');
+      return s;
+    }
+
+    function artKnife(g) {
+      // Handle (top-right)
+      g.save();
+      g.translate(300, 152); g.rotate(Math.atan2(-92, 152));
+      const hg = g.createLinearGradient(0, -24, 0, 24);
+      hg.addColorStop(0, '#7a5232'); hg.addColorStop(0.5, '#4a2c17'); hg.addColorStop(1, '#24130a');
+      g.fillStyle = hg; g.beginPath(); g.roundRect(0, -24, 170, 48, 18); g.fill();
+      g.fillStyle = '#2b2b2b'; g.fillRect(-6, -27, 14, 54);
+      for (const rx of [50, 95, 140]) {
+        g.fillStyle = '#b8a27a'; g.beginPath(); g.arc(rx, 0, 6, 0, 7); g.fill();
+        g.fillStyle = 'rgba(255,255,255,0.5)'; g.beginPath(); g.arc(rx - 2, -2, 2, 0, 7); g.fill();
+      }
+      g.restore();
+      // Cleaver blade, cutting edge along the bottom-left
+      const blade = new Path2D();
+      blade.moveTo(58, 262); blade.lineTo(292, 136); blade.lineTo(352, 226);
+      blade.quadraticCurveTo(230, 300, 96, 350); blade.quadraticCurveTo(48, 330, 58, 262); blade.closePath();
+      g.fillStyle = steel(g, 175, 200, 225, 300); g.fill(blade);
+      g.save(); g.clip(blade);
+      g.lineWidth = 1;
+      for (let i = 0; i < 30; i++) {
+        g.strokeStyle = `rgba(255,255,255,${rand(0.05, 0.18)})`;
+        const x = rand(60, 340), y = rand(140, 340);
+        g.beginPath(); g.moveTo(x, y); g.lineTo(x + rand(-30, 30), y + rand(-12, 12)); g.stroke();
+      }
+      g.restore();
+      g.strokeStyle = 'rgba(20,20,24,0.8)'; g.lineWidth = 3; g.stroke(blade);
+      g.beginPath(); g.moveTo(350, 228); g.quadraticCurveTo(230, 302, 98, 348);
+      g.strokeStyle = 'rgba(235,245,250,0.95)'; g.lineWidth = 3; g.stroke();
+      g.save(); g.globalCompositeOperation = 'destination-out';
+      g.beginPath(); g.arc(86, 270, 11, 0, 7); g.fill(); g.restore();
+      bloodSmear(g, [[160, 300, 1], [215, 280, 0.8], [118, 318, 0.7]]);
+    }
+
+    function artAxe(g) {
+      const ang = Math.atan2(345, 270);
+      // Handle (bottom-right)
+      g.save();
+      g.translate(190, 120); g.rotate(ang);
+      const wg = g.createLinearGradient(0, -15, 0, 15);
+      wg.addColorStop(0, '#8a6440'); wg.addColorStop(0.5, '#5a3b20'); wg.addColorStop(1, '#2e1c0d');
+      g.fillStyle = wg; g.beginPath(); g.roundRect(-20, -15, 450, 30, 12); g.fill();
+      g.fillStyle = '#262626';
+      for (let x = 300; x < 400; x += 12) g.fillRect(x, -16, 7, 32);
+      g.fillStyle = '#6d7378'; g.fillRect(418, -17, 14, 34);
+      g.restore();
+      // Double-bit head
+      g.save();
+      g.translate(205, 175); g.rotate(ang);
+      const bit = (sgn, reach) => {
+        const p = new Path2D();
+        p.moveTo(-26, 24 * sgn);
+        p.quadraticCurveTo(-34, reach * 0.55 * sgn, -96, reach * sgn);
+        p.quadraticCurveTo(0, (reach + 44) * sgn, 96, reach * sgn);
+        p.quadraticCurveTo(34, reach * 0.55 * sgn, 26, 24 * sgn);
+        p.closePath();
+        return p;
+      };
+      const st = g.createRadialGradient(-20, -20, 10, 0, 0, 180);
+      st.addColorStop(0, '#d5dbe0'); st.addColorStop(0.6, '#8b9298'); st.addColorStop(1, '#4c5257');
+      for (const p of [bit(1, 128), bit(-1, 118)]) {
+        g.fillStyle = st; g.fill(p);
+        g.strokeStyle = 'rgba(20,20,24,0.85)'; g.lineWidth = 3; g.stroke(p);
+      }
+      g.strokeStyle = 'rgba(235,245,250,0.95)'; g.lineWidth = 3;
+      g.beginPath(); g.moveTo(-96, 128); g.quadraticCurveTo(0, 172, 96, 128); g.stroke();
+      g.beginPath(); g.moveTo(-96, -118); g.quadraticCurveTo(0, -162, 96, -118); g.stroke();
+      g.fillStyle = '#5d6368'; g.beginPath(); g.roundRect(-34, -38, 68, 76, 8); g.fill();
+      g.strokeStyle = '#2c3034'; g.lineWidth = 2; g.stroke();
+      g.fillStyle = '#c9cfd4';
+      for (const [rx, ry] of [[-20, -24], [20, -24], [-20, 24], [20, 24]]) { g.beginPath(); g.arc(rx, ry, 4, 0, 7); g.fill(); }
+      bloodSmear(g, [[-30, 110, 1.1], [30, 118, 0.9], [-60, -95, 0.6]]);
+      g.restore();
+    }
+
+    function artPumpkin(g) {
+      const rg = g.createRadialGradient(220, 220, 20, 250, 280, 190);
+      rg.addColorStop(0, '#ffc06a'); rg.addColorStop(0.45, '#f08a1c');
+      rg.addColorStop(0.85, '#b4510a'); rg.addColorStop(1, '#6b2a03');
+      const lobes = [[150, 80], [350, 80], [205, 95], [295, 95], [250, 100]];
+      for (const [x, w] of lobes) { g.fillStyle = rg; g.beginPath(); g.ellipse(x, 275, w, 135, 0, 0, 7); g.fill(); }
+      g.strokeStyle = 'rgba(90,35,0,0.55)'; g.lineWidth = 4;
+      for (const [x, w] of lobes) { g.beginPath(); g.ellipse(x, 275, w, 135, 0, 0, 7); g.stroke(); }
+      g.fillStyle = '#4f5a1e';
+      g.beginPath(); g.moveTo(236, 150); g.quadraticCurveTo(238, 110, 268, 92);
+      g.lineTo(278, 104); g.quadraticCurveTo(258, 120, 262, 150); g.closePath(); g.fill();
+      const glow = g.createRadialGradient(250, 270, 10, 250, 270, 120);
+      glow.addColorStop(0, '#fff7b0'); glow.addColorStop(0.5, '#ffc21a'); glow.addColorStop(1, '#ff7a00');
+      g.fillStyle = glow;
+      g.beginPath(); g.moveTo(170, 250); g.lineTo(225, 215); g.lineTo(220, 268); g.closePath(); g.fill();
+      g.beginPath(); g.moveTo(330, 250); g.lineTo(275, 215); g.lineTo(280, 268); g.closePath(); g.fill();
+      g.beginPath(); g.moveTo(160, 300);
+      for (let i = 0; i <= 8; i++) g.lineTo(160 + i * 22.5, i % 2 ? 330 : 312);
+      g.quadraticCurveTo(250, 390, 160, 300); g.closePath(); g.fill();
+      g.strokeStyle = 'rgba(40,10,0,0.75)'; g.lineWidth = 3;
+      g.beginPath(); g.moveTo(250, 145); g.lineTo(240, 185); g.lineTo(262, 205); g.lineTo(250, 240); g.stroke();
+      g.beginPath(); g.moveTo(370, 190); g.lineTo(345, 215); g.lineTo(360, 245); g.stroke();
+      bloodSmear(g, [[200, 395, 1.2], [300, 390, 1]]);
+    }
+
+    function artGhost(g) {
+      const body = new Path2D();
+      body.moveTo(110, 420); body.lineTo(110, 230);
+      body.bezierCurveTo(110, 90, 390, 90, 390, 230);
+      body.lineTo(390, 420);
+      for (let k = 0; k < 4; k++) {
+        const x0 = 390 - k * 70;
+        body.quadraticCurveTo(x0 - 17.5, 450, x0 - 35, 420);
+        body.quadraticCurveTo(x0 - 52.5, 395, x0 - 70, 420);
+      }
+      body.closePath();
+      const bg = g.createRadialGradient(220, 190, 20, 250, 260, 230);
+      bg.addColorStop(0, '#ffffff'); bg.addColorStop(0.6, '#e6e2f0'); bg.addColorStop(1, '#b9b3cc');
+      g.fillStyle = bg; g.fill(body);
+      g.strokeStyle = 'rgba(120,110,150,0.6)'; g.lineWidth = 3; g.stroke(body);
+      g.fillStyle = '#141018';
+      g.beginPath(); g.ellipse(205, 240, 22, 30, 0, 0, 7); g.fill();
+      g.beginPath(); g.ellipse(295, 240, 22, 30, 0, 0, 7); g.fill();
+      g.fillStyle = '#ffffff';
+      g.beginPath(); g.arc(198, 230, 7, 0, 7); g.fill();
+      g.beginPath(); g.arc(288, 230, 7, 0, 7); g.fill();
+      g.fillStyle = 'rgba(255,150,170,0.55)';
+      g.beginPath(); g.arc(170, 285, 20, 0, 7); g.fill();
+      g.beginPath(); g.arc(330, 285, 20, 0, 7); g.fill();
+      g.fillStyle = '#3a2a3a'; g.beginPath(); g.ellipse(250, 298, 10, 13, 0, 0, 7); g.fill();
+      const slime = (x, y, col) => {
+        g.fillStyle = col;
+        g.beginPath(); g.arc(x, y, 34, 0, 7); g.fill();
+        for (let i = 0; i < 7; i++) {
+          const a = rand(0, 6.28), d = rand(30, 55);
+          g.beginPath(); g.arc(x + Math.cos(a) * d, y + Math.sin(a) * d, rand(5, 11), 0, 7); g.fill();
+        }
+        g.fillRect(x - 5, y, 10, rand(50, 80));
+        g.fillStyle = 'rgba(255,255,255,0.6)';
+        g.beginPath(); g.ellipse(x - 10, y - 12, 9, 5, -0.6, 0, 7); g.fill();
+      };
+      slime(120, 275, '#9b30ff');
+      slime(380, 290, '#39ff14');
+    }
+
+    // ---------------------------------------------------------------
+    // Weapon definitions. anchor = impact point in the 500x500 art frame,
+    // normal = direction from the buried edge toward the visible metal.
+    // ---------------------------------------------------------------
+    const DEFS = {
+      knife:   { file: 'knife.png',      weight: 0.35, size: 300, anchor: [150, 320], normal: [-0.43, -0.9],
+                 bury: 50, spin: true, embed: true, art: artKnife },
+      axe:     { file: 'axe.png',        weight: 0.30, size: 260, anchor: [105, 270], normal: [0.73, -0.68],
+                 bury: 64, spin: true, embed: true, art: artAxe },
+      pumpkin: { file: 'pumpkin.png',    weight: 0.20, size: 210, anchor: [250, 265], spin: false, embed: false, art: artPumpkin },
+      ghost:   { file: 'kiro-ghost.png', weight: 0.15, size: 220, anchor: [250, 250], spin: false, embed: false, art: artGhost },
+    };
+    const KIND_ORDER = ['knife', 'axe', 'pumpkin', 'ghost'];
+
+    for (const key of KIND_ORDER) {
+      const d = DEFS[key];
+      if (d.normal) {
+        const l = Math.hypot(d.normal[0], d.normal[1]);
+        d.normal = [d.normal[0] / l, d.normal[1] / l];
+      }
+      // anchor starts on the cutting edge; push the glass line `bury` px into the blade
+      if (d.bury) d.anchor = [d.anchor[0] + d.normal[0] * d.bury, d.anchor[1] + d.normal[1] * d.bury];
+      const art = document.createElement('canvas');
+      art.width = art.height = ASSET;
+      d.art(art.getContext('2d'));
+      d.sprite = art;
+      d.source = 'procedural';
+      const img = new Image();
+      img.onload = () => { if (img.naturalWidth > 0) { d.sprite = img; d.source = 'png'; } };
+      img.onerror = () => console.log('weapon PNG missing, using procedural art:', d.file);
+      img.src = 'assets/weapons/' + d.file;
+    }
+    // ---------------------------------------------------------------
+    // Procedural monitor glass shatter (pre-rendered once per impact)
+    // ---------------------------------------------------------------
+    function pointAt(pts, rr) {
+      for (let i = 1; i < pts.length; i++) {
+        if (Math.hypot(pts[i][0], pts[i][1]) >= rr) return pts[i];
+      }
+      return null;
+    }
+
+    function makeCrack(x, y, power, pinMs) {
+      const R = rand(170, 270) * power;
+      const size = Math.ceil(R * 2 + 24), o = size / 2;
+      const c = document.createElement('canvas');
+      c.width = c.height = size;
+      const g = c.getContext('2d');
+      const rayPath = new Path2D(), branchPath = new Path2D(), ringPath = new Path2D();
+      const rays = [];
+      const n = 8 + Math.floor(Math.random() * 7);           // 8-14 radial cracks
+      for (let i = 0; i < n; i++) {
+        let ang = (i / n) * Math.PI * 2 + rand(-0.22, 0.22);
+        const len = R * rand(0.5, 1);
+        const pts = [[0, 0]];
+        let r = rand(3, 8);
+        while (r < len) {
+          r += rand(9, 24); ang += rand(-0.16, 0.16);
+          pts.push([Math.cos(ang) * r, Math.sin(ang) * r]);
+        }
+        rays.push(pts);
+        rayPath.moveTo(o, o);
+        for (const p of pts) rayPath.lineTo(o + p[0], o + p[1]);
+        // Fractal side branches
+        const nb = Math.floor(Math.random() * 3);
+        for (let b = 0; b < nb && pts.length > 4; b++) {
+          const [bx, by] = pts[2 + Math.floor(Math.random() * (pts.length - 3))];
+          let ba = Math.atan2(by, bx) + (Math.random() < 0.5 ? -1 : 1) * rand(0.45, 0.9);
+          const bl = len * rand(0.18, 0.4);
+          let px = bx, py = by, d = 0;
+          branchPath.moveTo(o + px, o + py);
+          while (d < bl) {
+            const s = rand(7, 16); d += s; ba += rand(-0.2, 0.2);
+            px += Math.cos(ba) * s; py += Math.sin(ba) * s;
+            branchPath.lineTo(o + px, o + py);
+          }
+        }
+      }
+      // 2-4 concentric spiderweb rings joining neighbouring rays
+      const rings = 2 + Math.floor(Math.random() * 3);
+      for (let j = 1; j <= rings; j++) {
+        const rr = R * (j / (rings + 1)) * rand(0.85, 1.1);
+        let last = null;
+        for (let i = 0; i <= n; i++) {
+          const p = pointAt(rays[i % n], rr);
+          if (!p) { last = null; continue; }
+          if (!last) ringPath.moveTo(o + p[0], o + p[1]);
+          else ringPath.quadraticCurveTo(o + (last[0] + p[0]) * 0.45, o + (last[1] + p[1]) * 0.45, o + p[0], o + p[1]);
+          last = Math.random() < 0.15 ? null : p;   // broken web segments
+        }
+      }
+      // Double stroke: dark shadow + icy refraction highlight
+      g.lineJoin = 'miter';
+      for (const [style, dx] of [['rgba(0,0,0,0.8)', 1], ['rgba(235,248,255,0.92)', 0]]) {
+        g.save(); g.translate(dx, dx); g.strokeStyle = style;
+        g.lineWidth = 1.3; g.stroke(rayPath);
+        g.lineWidth = 1; g.stroke(branchPath); g.stroke(ringPath);
+        g.restore();
+      }
+      // Crushed-glass impact pit
+      for (let i = 0; i < 12; i++) {
+        const a = rand(0, 6.28), r1 = rand(4, 14) * power, r2 = r1 + rand(6, 18) * power;
+        g.beginPath(); g.moveTo(o, o);
+        g.lineTo(o + Math.cos(a) * r2, o + Math.sin(a) * r2);
+        g.lineTo(o + Math.cos(a + 0.5) * r1, o + Math.sin(a + 0.5) * r1);
+        g.closePath();
+        g.fillStyle = `rgba(235,248,255,${rand(0.12, 0.35).toFixed(2)})`; g.fill();
+      }
+      const pit = g.createRadialGradient(o, o, 0, o, o, 16 * power);
+      pit.addColorStop(0, 'rgba(255,255,255,0.75)'); pit.addColorStop(1, 'rgba(255,255,255,0)');
+      g.fillStyle = pit; g.fillRect(o - 24, o - 24, 48, 48);
+      return { img: c, x: x - o, y: y - o, born: now(), pinMs };
+    }
+
+    // ---------------------------------------------------------------
+    // Bake an impacted weapon once: embed mask along a jagged fault line,
+    // depth shading + seam on the weapon pixels only, baked drop shadow.
+    // ---------------------------------------------------------------
+    function faultPoints(n) {
+      const e = [-n[1], n[0]], pts = [];
+      for (let t = -720; t <= 720; t += 14) {
+        const off = rand(-7, 7) + (Math.random() < 0.12 ? rand(-10, 10) : 0);
+        pts.push([e[0] * t + n[0] * off, e[1] * t + n[1] * off]);
+      }
+      return pts;
+    }
+
+    function bakeWeapon(w) {
+      const d = w.def, P = 60, S = ASSET + P * 2;
+      const AX = d.anchor[0] + P, AY = d.anchor[1] + P;
+      const wc = document.createElement('canvas');
+      wc.width = wc.height = S;
+      const wg = wc.getContext('2d');
+      if (d.embed) {
+        const n = d.normal, pts = faultPoints(n);
+        const first = pts[0], last = pts[pts.length - 1];
+        wg.save();
+        wg.beginPath();
+        wg.moveTo(AX + first[0], AY + first[1]);
+        for (const p of pts) wg.lineTo(AX + p[0], AY + p[1]);
+        wg.lineTo(AX + last[0] + n[0] * 1500, AY + last[1] + n[1] * 1500);
+        wg.lineTo(AX + first[0] + n[0] * 1500, AY + first[1] + n[1] * 1500);
+        wg.closePath();
+        wg.clip();                                   // blade tip disappears into the glass
+        wg.drawImage(d.sprite, P, P, ASSET, ASSET);
+        wg.restore();
+        wg.globalCompositeOperation = 'source-atop';
+        const gr = wg.createLinearGradient(AX, AY, AX + n[0] * 60, AY + n[1] * 60);
+        gr.addColorStop(0, 'rgba(10,0,0,0.85)'); gr.addColorStop(1, 'rgba(0,0,0,0)');
+        wg.fillStyle = gr; wg.fillRect(0, 0, S, S);
+        const seam = new Path2D();
+        seam.moveTo(AX + first[0], AY + first[1]);
+        for (const p of pts) seam.lineTo(AX + p[0], AY + p[1]);
+        wg.strokeStyle = 'rgba(40,0,0,0.9)'; wg.lineWidth = 9; wg.stroke(seam);
+        wg.save(); wg.translate(n[0] * 5, n[1] * 5);
+        wg.strokeStyle = 'rgba(235,248,255,0.92)'; wg.lineWidth = 2.5; wg.stroke(seam);
+        wg.restore();
+        wg.globalCompositeOperation = 'source-over';
+      } else {
+        wg.drawImage(d.sprite, P, P, ASSET, ASSET);
+      }
+      // Drop shadow: screen offset (6, 9) rotated back into art space
+      const out = document.createElement('canvas');
+      out.width = out.height = S;
+      const og = out.getContext('2d');
+      const s = d.size / ASSET, sx = 6 / s, sy = 9 / s, a = -w.finalAngle;
+      og.shadowColor = 'rgba(0,0,0,0.6)';
+      og.shadowBlur = 8 / s;
+      og.shadowOffsetX = sx * Math.cos(a) - sy * Math.sin(a);
+      og.shadowOffsetY = sx * Math.sin(a) + sy * Math.cos(a);
+      og.drawImage(wc, 0, 0);
+      return { canvas: out, P };
+    }
+
+    function toScreen(w, px, py) {
+      const d = w.def, s = d.size / ASSET;
+      const lx = (px - d.anchor[0]) * s, ly = (py - d.anchor[1]) * s;
+      const c = Math.cos(w.finalAngle), sn = Math.sin(w.finalAngle);
+      return [w.tx + lx * c - ly * sn, w.ty + lx * sn + ly * c];
+    }
+
+    // ---------------------------------------------------------------
+    // State C: global click -> weapon throw
+    // ---------------------------------------------------------------
+    function pickKind() {
+      let r = Math.random();
+      for (const k of KIND_ORDER) { r -= DEFS[k].weight; if (r <= 0) return k; }
+      return 'knife';
+    }
+
+    function throwAt(tx, ty, forced) {
+      const kind = forced || pickKind(), def = DEFS[kind];
+      const t = now();
+      const fromLeft = Math.random() < 0.5;
+      const foreground = kind === 'ghost' || Math.random() < 0.4;
+      let x0 = tx, y0 = ty;
+      if (!foreground) {                           // off-screen corner
+        x0 = fromLeft ? -160 : W + 160;
+        y0 = Math.random() < 0.5 ? -160 : H + 160;
+      }
+      let finalAngle = 0, spins = 0;
+      if (def.spin) {
+        finalAngle = (fromLeft ? rand(-45, -40) : rand(-35, -30)) * DEG;
+        spins = rand(2, 3) * Math.PI * 2 * (fromLeft ? 1 : -1);
+      } else if (kind === 'pumpkin') {
+        finalAngle = rand(-0.2, 0.2);
+        spins = Math.PI * (fromLeft ? 1 : -1);     // ~180 degree tumble
+      }
+      const pinMs = rand(6000, 10000);
+      weapons.push({
+        kind, def, x0, y0, tx, ty, start: t, dur: rand(90, 130),
+        s0: kind === 'ghost' ? 2.8 : 2.6, spins, finalAngle, pinMs,
+        x: x0, y: y0, angle: finalAngle + spins, scale: 2.6, sx: 1, sy: 1,
+        alpha: 1, slip: 0, impacted: false, impactAt: 0, seed: Math.random() * 10,
+        baked: null, lastTrail: 0,
+      });
+      // Cap: force the oldest impacted weapon into its fade-out
+      if (weapons.length > MAX_WEAPONS) {
+        const old = weapons.find((w) => w.impacted && t - w.impactAt < w.pinMs);
+        if (old) old.pinMs = t - old.impactAt;
+      }
+    }
+
+    function addEmitter(x, y, kind, dur, mMin, mMax) {
+      const t = now();
+      emitters.push({ x, y, kind, until: t + dur, next: t + rand(150, 400), mMin, mMax });
+    }
+
+    function updateEmitters(t) {
+      for (let i = emitters.length - 1; i >= 0; i--) {
+        const e = emitters[i];
+        if (t > e.until) { emitters.splice(i, 1); continue; }
+        if (t >= e.next) {
+          spawnDrip(e.x + rand(-4, 4), e.y, rand(e.mMin, e.mMax), e.kind);
+          e.next = t + rand(380, 950);
+        }
+      }
+    }
+
+    function pumpkinBurst(x, y) {
+      const pulp = 14 + Math.floor(Math.random() * 7);
+      for (let i = 0; i < pulp && fx.length < MAX_FX; i++) {
+        const a = rand(0, 6.28), s = rand(3, 10);
+        fx.push({ type: 'pulp', x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s - 2, g: 0.25,
+          rot: rand(0, 6.28), vr: rand(-0.2, 0.2), size: rand(6, 14), life: rand(250, 600) });
+      }
+      const seeds = 18 + Math.floor(Math.random() * 9);
+      for (let i = 0; i < seeds && fx.length < MAX_FX; i++) {
+        const a = rand(0, 6.28), s = rand(4, 12);
+        fx.push({ type: 'seed', x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s - 3, g: 0.45,
+          rot: rand(0, 6.28), vr: rand(-0.35, 0.35), size: rand(5, 8), life: 1400 });
+      }
+      for (let i = 0; i < 9; i++) {
+        addNode(x + rand(-60, 60), y + rand(-30, 70), rand(8, 16), Math.random() < 0.6, Math.random(),
+          Math.random() < 0.65 ? 'pumpkin' : 'blood');
+      }
+      for (let i = 0; i < 6; i++) {
+        spawnDrip(x + rand(-70, 70), y + rand(40, 80), rand(4, 8), i < 4 ? 'pumpkin' : 'blood');
+      }
+      addEmitter(x - 40, y + 75, 'pumpkin', 3000, 3.5, 6);
+      addEmitter(x + 35, y + 70, 'blood', 3000, 3.5, 6);
+    }
+
+    function ectoSplat(x, y) {
+      for (let i = 0; i < 18; i++) {
+        const left = i % 2 === 0;
+        const a = rand(0, 6.28), d = rand(40, 110);
+        addNode(x + (left ? -1 : 1) * Math.abs(Math.cos(a) * d), y + Math.sin(a) * d * 0.7,
+          rand(6, 14), Math.random() < 0.6, Math.random(), left ? 'purple' : 'green');
+      }
+      for (let i = 0; i < 6; i++) {
+        const left = i % 2 === 0;
+        spawnDrip(x + (left ? -1 : 1) * rand(50, 100), y + rand(0, 60), rand(4, 7), left ? 'purple' : 'green');
+      }
+    }
+
+    function ghostTrail(w) {
+      const s = w.def.size * w.sx, h = w.def.size * w.sy;
+      // Purple slime streams down the left side, green down the right, blood in between
+      addNode(w.x - s * 0.36 + rand(-6, 6), w.y + rand(-0.25, 0.2) * h, rand(5, 9), Math.random() < 0.5, Math.random(), 'purple');
+      addNode(w.x + s * 0.36 + rand(-6, 6), w.y + rand(-0.25, 0.2) * h, rand(5, 9), Math.random() < 0.5, Math.random(), 'green');
+      if (Math.random() < 0.35) addNode(w.x + rand(-0.2, 0.2) * s, w.y - h * 0.3, rand(4, 7), false);
+    }
+
+    function impact(w, t) {
+      w.impacted = true; w.impactAt = t;
+      w.x = w.tx; w.y = w.ty; w.scale = 1; w.angle = w.finalAngle;
+      const { tx, ty } = w;
+      if (w.def.embed) {
+        cracks.push(makeCrack(tx, ty, 1, w.pinMs));
+        glassSound(1);
+        wetSplat(0.25);
+        w.baked = bakeWeapon(w);
+        addEmitter(tx, ty + 4, 'blood', rand(3000, 4500), 4, 7);     // crack center
+        // Lowest visible blade point on the glass seam
+        const [ax, ay] = w.def.anchor, [nx, ny] = w.def.normal;
+        let low = null;
+        for (const off of [-55, 0, 55]) {
+          const s = toScreen(w, ax - ny * off, ay + nx * off);
+          if (!low || s[1] > low[1]) low = s;
+        }
+        if (low) addEmitter(low[0], low[1], 'blood', rand(2500, 4000), 3.5, 6); // lowest blade edge
+      } else if (w.kind === 'pumpkin') {
+        cracks.push(makeCrack(tx, ty, 0.75, w.pinMs));
+        glassSound(0.45);
+        wetSplat(0.75);
+        w.baked = bakeWeapon(w);
+        pumpkinBurst(tx, ty);
+      } else {
+        cracks.push(makeCrack(tx, ty, 0.55, w.pinMs));
+        ghostSound();
+        w.baked = bakeWeapon(w);
+        ectoSplat(tx, ty);
+        w.lastTrail = t;
+      }
+      splatter(tx, ty);
+    }
+
+    function updateWeapons(t, k) {
+      for (let i = weapons.length - 1; i >= 0; i--) {
+        const w = weapons[i];
+        if (!w.impacted) {
+          const p = clamp((t - w.start) / w.dur, 0, 1), e = p * p;   // accelerating flight
+          w.x = lerp(w.x0, w.tx, e); w.y = lerp(w.y0, w.ty, e);
+          w.scale = lerp(w.s0, 1, e);
+          if (w.kind === 'ghost') w.angle = Math.sin(p * Math.PI * 3 + w.seed) * 0.22 * (1 - p);
+          else w.angle = w.finalAngle + w.spins * (1 - p);              // exact lock at t = 1
+          if (p >= 1) impact(w, t);
+          continue;
+        }
+        const age = t - w.impactAt;
+        if (w.def.spin) {
+          w.angle = w.finalAngle;
+          if (age < 150) {                                              // damped spring recoil
+            const s = age / 1000;
+            w.angle += 0.14 * Math.exp(-s / 0.045) * Math.sin(s * 2 * Math.PI / 0.04);
+          }
+        } else if (w.kind === 'pumpkin') {
+          const q = easeOut(clamp(age / 220, 0, 1));
+          w.sx = lerp(1.25, 1, q); w.sy = lerp(0.8, 1, q);
+        } else {
+          const q = clamp(age / 2500, 0, 1);
+          const squ = age < 160 ? easeOut(age / 160) : 1;
+          w.sx = lerp(1, 1.3, squ) - 0.06 * q;
+          w.sy = lerp(1, 0.7, squ) + 0.04 * q;
+          w.y = w.ty + 170 * smooth(q);                                 // slow 2.5 s slide
+          w.angle = Math.sin(age * 0.004 + w.seed) * 0.05;
+          if (q < 1 && t - w.lastTrail > 35) { w.lastTrail = t; ghostTrail(w); }
+        }
+        if (age > w.pinMs) {                                            // slip and fade
+          const f = (age - w.pinMs) / 1300;
+          w.slip += 0.25 * k * (1 + f * 3);
+          w.alpha = 1 - f;
+          if (f >= 1) { weapons.splice(i, 1); continue; }
+        }
+      }
+    }
+    // ---------------------------------------------------------------
+    // Pumpkin pulp & seeds
+    // ---------------------------------------------------------------
+    function updateFx(k) {
+      for (let i = fx.length - 1; i >= 0; i--) {
+        const p = fx[i];
+        p.vy += p.g * k;
+        p.vx *= Math.pow(0.985, k);
+        p.x += p.vx * k; p.y += p.vy * k;
+        p.rot += p.vr * k;
+        p.life -= 16.67 * k;
+        if (p.life <= 0 || p.y > H + 40) {
+          if (p.type === 'pulp' && p.y < H) {          // pulp sticks to the glass
+            addNode(p.x, p.y, p.size * 0.7, true, Math.random(), 'pumpkin');
+            if (Math.random() < 0.5) spawnDrip(p.x, p.y, rand(3, 6), Math.random() < 0.6 ? 'pumpkin' : 'blood');
+          }
+          fx.splice(i, 1);
+        }
+      }
+    }
+
+    function drawFx(g) {
+      for (const p of fx) {
+        g.save();
+        g.translate(p.x, p.y); g.rotate(p.rot);
+        g.globalAlpha = clamp(p.life / 250, 0, 1);
+        if (p.type === 'pulp') {
+          const gl = g.createRadialGradient(0, 0, 0, 0, 0, p.size * 1.7);
+          gl.addColorStop(0, '#fff3b0'); gl.addColorStop(0.35, '#ffa31a');
+          gl.addColorStop(0.7, 'rgba(255,110,0,0.35)'); gl.addColorStop(1, 'rgba(255,90,0,0)');
+          g.fillStyle = gl;
+          g.beginPath(); g.arc(0, 0, p.size * 1.7, 0, 6.2832); g.fill();
+          g.fillStyle = '#ff8c1a';
+          g.beginPath(); g.ellipse(0, 0, p.size, p.size * 0.7, 0, 0, 6.2832); g.fill();
+        } else {
+          g.fillStyle = '#f3e2b3';
+          g.beginPath(); g.ellipse(0, 0, p.size, p.size * 0.55, 0, 0, 6.2832); g.fill();
+          g.strokeStyle = '#b89a5e'; g.lineWidth = 1; g.stroke();
+        }
+        g.restore();
+      }
+    }
+
+    // ---------------------------------------------------------------
+    // Oxidation: color / alpha / specular by age
+    // ---------------------------------------------------------------
+    function bodyColor(n, age) {
+      const P = KINDS[n.kind], tn = n.tone;
+      const r0 = P.lo[0] + (P.hi[0] - P.lo[0]) * tn;
+      const g0 = P.lo[1] + (P.hi[1] - P.lo[1]) * tn;
+      const b0 = P.lo[2] + (P.hi[2] - P.lo[2]) * tn;
+      const q = age <= FRESH_END ? 0 : smooth(clamp((age - FRESH_END) / (COAG_END - FRESH_END), 0, 1));
+      return `rgb(${(r0 + (P.dry[0] - r0) * q) | 0},${(g0 + (P.dry[1] - g0) * q) | 0},${(b0 + (P.dry[2] - b0) * q) | 0})`;
+    }
+
+    function drawGloss(x, y, r, hl, alpha) {
+      if (hl <= 0.03 || alpha <= 0.03) return;
+      const g = cx.gloss;
+      g.globalAlpha = alpha;
+      g.fillStyle = 'rgba(255, 215, 215, 0.85)';
+      g.beginPath();
+      g.ellipse(x - r * 0.3, y - r * 0.34, Math.max(0.6, r * 0.3 * hl), Math.max(0.4, r * 0.2 * hl), -0.6, 0, Math.PI * 2);
+      g.fill();
+    }
+
+    // Circle, or a round-capped capsule when (x2, y2) is given.
+    function drawBlob(x, y, r, kind, color, alpha, x2, y2) {
+      const rim = cx.rim, body = KINDS[kind].ecto ? cx.ecto : cx.body;
+      const rr = r + Math.min(RIM_GROW, r * 0.3);
+      rim.globalAlpha = alpha;
+      body.globalAlpha = alpha;
+      if (x2 !== undefined) {
+        rim.strokeStyle = KINDS[kind].rim; rim.lineWidth = rr * 2;
+        rim.beginPath(); rim.moveTo(x2, y2); rim.lineTo(x, y); rim.stroke();
+        body.strokeStyle = color; body.lineWidth = r * 2;
+        body.beginPath(); body.moveTo(x2, y2); body.lineTo(x, y); body.stroke();
+        return;
+      }
+      rim.fillStyle = KINDS[kind].rim;
+      rim.beginPath(); rim.arc(x, y, rr, 0, 6.2832); rim.fill();
+      body.fillStyle = color;
+      body.beginPath(); body.arc(x, y, r, 0, 6.2832); body.fill();
+    }
+
+    const freshColor = (kind) => { const h = KINDS[kind].hi; return `rgb(${h[0]},${h[1]},${h[2]})`; };
+
+    let ectoVisible = false;
+    function render(t) {
+      for (const id of LAYERS) cx[id].clearRect(0, 0, W, H);
+      cx.rim.lineCap = cx.body.lineCap = cx.ecto.lineCap = 'round';
+
+      // Glass cracks (pinned, then fade)
+      const cg = cx.crack;
+      for (let i = cracks.length - 1; i >= 0; i--) {
+        const c = cracks[i], age = t - c.born;
+        let a = 1;
+        if (age > c.pinMs) {
+          a = 1 - (age - c.pinMs) / 1000;
+          if (a <= 0) { cracks.splice(i, 1); continue; }
+        }
+        cg.globalAlpha = a;
+        cg.drawImage(c.img, c.x, c.y);
+      }
+      cg.globalAlpha = 1;
+
+      let ecto = 0;
+      for (let i = nodes.length - 1; i >= 0; i--) {
+        const n = nodes[i];
+        const age = (t - n.born) / 1000;
+        if (age >= n.life) {                 // evaporated: free memory
+          nodes[i] = nodes[nodes.length - 1];
+          nodes.pop();
+          continue;
+        }
+        if (KINDS[n.kind].ecto) ecto++;
+        const alpha = age <= COAG_END ? 1 : 1 - (age - COAG_END) / (n.life - COAG_END);
+        const r = age <= COAG_END ? n.r : n.r * (0.55 + 0.45 * alpha);
+        drawBlob(n.x, n.y, r, n.kind, bodyColor(n, age), alpha, n.x2, n.y2);
+        if (n.hl) {
+          const hl = age < FRESH_END ? 1 : age < COAG_END ? 1 - 0.8 * (age - FRESH_END) / (COAG_END - FRESH_END) : 0.2 * alpha;
+          drawGloss(n.x, n.y, r, hl, alpha);
+        }
+      }
+      for (const d of drips) {
+        if (KINDS[d.kind].ecto) ecto++;
+        const r = headRadius(d);
+        drawBlob(d.x, d.y, r, d.kind, freshColor(d.kind), 1);
+        drawGloss(d.x, d.y, r, 1, 1);
+      }
+      for (const p of particles) {
+        if (p.micro) continue;
+        drawBlob(p.x, p.y, p.radius, 'blood', '#b80404', 1);
+      }
+      cx.rim.globalAlpha = cx.body.globalAlpha = cx.ecto.globalAlpha = cx.gloss.globalAlpha = 1;
+
+      const showEcto = ecto > 0;
+      if (showEcto !== ectoVisible) {
+        ectoVisible = showEcto;
+        cv.ecto.style.visibility = showEcto ? 'visible' : 'hidden';
+      }
+
+      // Weapons
+      const wg = cx.weapon;
+      for (const w of weapons) {
+        const d = w.def, s = (d.size / ASSET) * w.scale;
+        const [ax, ay] = d.anchor;
+        wg.save();
+        wg.globalAlpha = clamp(w.alpha, 0, 1);
+        wg.translate(w.x, w.y + w.slip);
+        wg.rotate(w.angle);
+        wg.scale(s * w.sx, s * w.sy);
+        if (w.baked) wg.drawImage(w.baked.canvas, -ax - w.baked.P, -ay - w.baked.P);
+        else wg.drawImage(d.sprite, -ax, -ay, ASSET, ASSET);
+        wg.restore();
+      }
+
+      drawFx(cx.fx);
+    }
+
+    // ---------------------------------------------------------------
+    // Scripted demo (npm run demo): trail, pool, then one of each weapon
+    // ---------------------------------------------------------------
+    function runDemo() {
+      const t0 = now();
+      demoUntil = t0 + 5200;
+      let px = W * 0.15, py = H * 0.3;
+      const id = setInterval(() => {
+        const e = now() - t0;
+        let x = W * 0.42, y = H * 0.36;
+        if (e < 900) {
+          const p = e / 900;
+          x = lerp(W * 0.15, W * 0.42, p);
+          y = lerp(H * 0.3, H * 0.36, p) + Math.sin(p * 9) * 20;
+        }
+        handleMouse({ x, y, vx: x - px, vy: y - py, isClicked: false });
+        px = x; py = y;
+        if (e > 5000) clearInterval(id);
+      }, 16);
+      const shots = [['knife', 0.3, 0.58], ['axe', 0.64, 0.4], ['pumpkin', 0.8, 0.64], ['ghost', 0.52, 0.66]];
+      [[0.22, 0.7], [0.36, 0.22]].forEach(([a, b], i) => setTimeout(() => { splatter(W * a, H * b); wetSplat(0.45); }, 1000 + i * 150));
+      shots.forEach(([kind, fxr, fyr], i) => setTimeout(() => throwAt(W * fxr, H * fyr, kind), 1400 + i * 600));
+    }
+    if (DEMO) {
+      runDemo(); setInterval(runDemo, 16000);
+    }
+
+    // ---------------------------------------------------------------
+    // Main loop. setInterval, not rAF: unfocused transparent windows
+    // throttle requestAnimationFrame to 0 FPS.
+    // ---------------------------------------------------------------
+    let last = now();
+    function frame() {
+      const t = now();
+      const dt = Math.min(t - last, 100);
+      last = t;
+      const k = clamp(dt / 16.667, 0.5, 3);
+      updatePool(dt);
+      updateWeapons(t, k);
+      updateEmitters(t);
+      updateParticles(k);
+      updateFx(k);
+      updateDrips(k);
+      render(t);
+    }
+    setInterval(frame, 16);
+  })();
+  </script>
+</body>
+</html>
